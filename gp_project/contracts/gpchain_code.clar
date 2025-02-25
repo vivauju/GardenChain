@@ -1,5 +1,5 @@
-;; Community Garden Plot Management Smart Contract 
-;; Added featured gardener selection and harvest bonus distribution
+;; Community Garden Plot Management Smart Contract
+;; Complete implementation with community fund and enhanced features
 
 ;; Constants
 (define-constant GARDEN-ADMIN tx-sender)
@@ -19,17 +19,21 @@
 (define-data-var season-end-block uint u0)
 (define-data-var featured-gardener (optional principal) none)
 (define-data-var harvest-share-distributed bool false)
-(define-data-var minimum-gardeners uint u3)
-(define-data-var max-plots-per-gardener uint u5)
+(define-data-var minimum-gardeners uint u5)
+(define-data-var max-plots-per-gardener uint u10)
+(define-data-var community-fund-rate uint u5) ;; 5% contribution to community fund
+(define-data-var seasonal-name (string-ascii 30) "")
 
 ;; Maps
 (define-map gardener-plots principal uint)
 (define-map gardener-registry {position: uint} {gardener: principal})
 (define-map gardener-positions principal uint)
+(define-map plot-usage {season: (string-ascii 30), gardener: principal} {crop-type: (string-ascii 20), organic: bool})
 
 ;; Variables
 (define-data-var gardener-count uint u0)
 (define-data-var total-plots-reserved uint u0)
+(define-data-var season-count uint u0)
 
 ;; Private Functions
 (define-private (is-admin)
@@ -63,8 +67,12 @@
   )
 )
 
+(define-private (calculate-community-contribution (amount uint))
+  (/ (* amount (var-get community-fund-rate)) u100)
+)
+
 ;; Public Functions
-(define-public (start-growing-season (duration uint) (fee uint) (min-gardeners uint) (max-plots uint))
+(define-public (start-growing-season (duration uint) (fee uint) (min-gardeners uint) (max-plots uint) (season-name (string-ascii 30)) (fund-rate uint))
   (begin
     (asserts! (is-admin) ERR-NOT-AUTHORIZED)
     (asserts! (not (is-season-active)) ERR-SEASON-ACTIVE)
@@ -72,26 +80,30 @@
     (asserts! (> fee u0) ERR-INVALID-PARAMETER)
     (asserts! (>= min-gardeners u2) ERR-INVALID-PARAMETER)
     (asserts! (> max-plots u0) ERR-INVALID-PARAMETER)
+    (asserts! (< fund-rate u20) ERR-INVALID-PARAMETER)
     (var-set growing-season-active true)
     (var-set plot-reservation-fee fee)
     (var-set season-end-block (+ block-height duration))
     (var-set minimum-gardeners min-gardeners)
     (var-set max-plots-per-gardener max-plots)
+    (var-set community-fund-rate fund-rate)
     (var-set harvest-share-distributed false)
     (var-set gardener-count u0)
     (var-set total-plots-reserved u0)
-    (var-set featured-gardener none)
+    (var-set seasonal-name season-name)
+    (var-set season-count (+ (var-get season-count) u1))
     (ok true)
   )
 )
 
-(define-public (reserve-plots (quantity uint))
+(define-public (reserve-plots (quantity uint) (crop-type (string-ascii 20)) (organic bool))
   (let (
     (gardener tx-sender)
     (fee (var-get plot-reservation-fee))
     (total-fee (* fee quantity))
     (current-plot-count (default-to u0 (map-get? gardener-plots gardener)))
     (new-plot-count (+ current-plot-count quantity))
+    (current-season (var-get seasonal-name))
   )
     (asserts! (is-season-active) ERR-SEASON-CLOSED)
     (asserts! (<= block-height (var-get season-end-block)) ERR-SEASON-ENDED)
@@ -99,6 +111,7 @@
     (asserts! (<= new-plot-count (var-get max-plots-per-gardener)) ERR-INVALID-PARAMETER)
     (try! (stx-transfer? total-fee gardener (as-contract tx-sender)))
     (map-set gardener-plots gardener new-plot-count)
+    (map-set plot-usage {season: current-season, gardener: gardener} {crop-type: crop-type, organic: organic})
     (match (map-get? gardener-positions gardener)
       position true
       (register-gardener gardener)
@@ -139,10 +152,12 @@
     (asserts! (not (var-get harvest-share-distributed)) ERR-ALREADY-DISTRIBUTED)
     (let (
       (total-plot-fees (var-get total-plots-reserved))
+      (community-contribution (calculate-community-contribution total-plot-fees))
+      (gardener-bonus (- total-plot-fees community-contribution))
     )
-      (try! (as-contract (stx-transfer? total-plot-fees tx-sender selected)))
+      (try! (as-contract (stx-transfer? gardener-bonus tx-sender selected)))
       (var-set harvest-share-distributed true)
-      (ok total-plot-fees)
+      (ok gardener-bonus)
     )
   )
 )
@@ -159,12 +174,19 @@
     total-plots: (var-get total-plots-reserved),
     gardener-count: (var-get gardener-count),
     minimum-gardeners: (var-get minimum-gardeners),
-    max-plots-per-gardener: (var-get max-plots-per-gardener)
+    max-plots-per-gardener: (var-get max-plots-per-gardener),
+    season-name: (var-get seasonal-name),
+    community-fund-rate: (var-get community-fund-rate),
+    season-count: (var-get season-count)
   })
 )
 
 (define-read-only (get-gardener-plots (gardener principal))
   (ok (default-to u0 (map-get? gardener-plots gardener)))
+)
+
+(define-read-only (get-gardener-crop-info (gardener principal))
+  (ok (map-get? plot-usage {season: (var-get seasonal-name), gardener: gardener}))
 )
 
 (define-read-only (get-featured-gardener)
@@ -174,8 +196,37 @@
 (define-read-only (get-harvest-info)
   (ok {
     distributed: (var-get harvest-share-distributed),
-    total-funds: (var-get total-plots-reserved)
+    total-funds: (var-get total-plots-reserved),
+    community-contribution: (calculate-community-contribution (var-get total-plots-reserved)),
+    gardener-bonus: (- (var-get total-plots-reserved) (calculate-community-contribution (var-get total-plots-reserved)))
   })
+)
+
+(define-public (update-crop-info (crop-type (string-ascii 20)) (organic bool))
+  (let (
+    (gardener tx-sender)
+    (current-season (var-get seasonal-name))
+  )
+    (asserts! (is-season-active) ERR-SEASON-CLOSED)
+    (asserts! (> (default-to u0 (map-get? gardener-plots gardener)) u0) ERR-INVALID-PARAMETER)
+    (map-set plot-usage {season: current-season, gardener: gardener} {crop-type: crop-type, organic: organic})
+    (ok true)
+  )
+)
+
+(define-public (collect-community-fund)
+  (begin
+    (asserts! (is-admin) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-season-active)) ERR-SEASON-CLOSED)
+    (asserts! (var-get harvest-share-distributed) ERR-ALREADY-DISTRIBUTED)
+    (let (
+      (total-fees (var-get total-plots-reserved))
+      (contribution (calculate-community-contribution total-fees))
+    )
+      (try! (as-contract (stx-transfer? contribution tx-sender GARDEN-ADMIN)))
+      (ok contribution)
+    )
+  )
 )
 
 (define-public (cancel-growing-season)
